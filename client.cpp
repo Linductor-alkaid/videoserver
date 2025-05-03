@@ -24,6 +24,9 @@ std::atomic<bool> exit_program{false};
 std::atomic<int> receiver_status{200}; // 200=正常，300=拥塞
 std::vector<Json::Value> servers;
 std::mutex servers_mutex;
+Json::Value last_server_info;
+int last_cam_index = -1;
+std::atomic<bool> abnormal_disconnect{false};
 int heartbeat_socket = -1;
 
 // ================== 服务发现模块 ==================
@@ -79,23 +82,60 @@ void discover_servers() {
 void handle_heartbeat() {
     char buffer[16];
     while (is_connected && !exit_program) {
-        if (recv(heartbeat_socket, buffer, sizeof(buffer), 0) > 0) {
-            std::string status = std::to_string(receiver_status.load());
-            send(heartbeat_socket, status.c_str(), status.size(), 0);
+        int bytes_received = recv(heartbeat_socket, buffer, sizeof(buffer), 0);
+        
+        // 检测连接断开
+        if (bytes_received <= 0) {
+            if (bytes_received == 0) {
+                abnormal_disconnect = false;
+                std::cout << "[心跳] 连接正常关闭" << std::endl;
+            } else {
+                abnormal_disconnect = true;
+                perror("[心跳] 接收错误");
+            }
+            is_connected = false;
+            break;
+        }
+        
+        // 正常处理心跳
+        std::string status = std::to_string(receiver_status.load());
+        if (send(heartbeat_socket, status.c_str(), status.size(), 0) <= 0) {
+            perror("[心跳] 发送状态失败");
+            is_connected = false;
+            break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    heartbeat_socket = -1;
+    
+    // 清理资源
+    if (heartbeat_socket != -1) {
+        close(heartbeat_socket);
+        heartbeat_socket = -1;
+    }
 }
 
 // ================== 摄像头选择处理 ==================
-int select_camera(int sock) {
+int select_camera(int sock, int auto_cam_index = -1) {
     char buffer[1024];
     int n = recv(sock, buffer, sizeof(buffer), 0);
     if (n <= 0) return -1;
 
     Json::Value cam_list;
-    Json::Reader().parse(buffer, buffer + n, cam_list);
+    if (!Json::Reader().parse(buffer, buffer + n, cam_list)) return -1;
+
+    if (auto_cam_index != -1) {
+        // 自动选择之前的摄像头
+        for (Json::Value::ArrayIndex i = 0; i < cam_list["cameras"].size(); ++i) {
+            if (cam_list["cameras"][i].asInt() == auto_cam_index) {
+                Json::Value response;
+                response["camera_index"] = auto_cam_index;
+                std::string json_str = Json::FastWriter().write(response);
+                send(sock, json_str.c_str(), json_str.size(), 0);
+                return auto_cam_index;
+            }
+        }
+        return -1; // 摄像头不存在
+    }
     
     std::cout << "\n===== 可用摄像头列表 =====" << std::endl;
     for (Json::Value::ArrayIndex i = 0; i < cam_list["cameras"].size(); ++i) {
@@ -231,6 +271,38 @@ int main() {
         addr.sin_port = htons(target["heartbeat_port"].asInt());
         inet_pton(AF_INET, target["ip"].asString().c_str(), &addr.sin_addr);
 
+        last_server_info = target; // 保存上次连接信息
+
+        // 处理连接断开后的逻辑
+        if (abnormal_disconnect.load()) {
+            std::cout << "尝试重新连接..." << std::endl;
+            int retries = 3;
+            while (retries-- > 0 && !exit_program) {
+                heartbeat_socket = socket(AF_INET, SOCK_STREAM, 0);
+                struct sockaddr_in addr;
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(last_server_info["heartbeat_port"].asInt());
+                inet_pton(AF_INET, last_server_info["ip"].asString().c_str(), &addr.sin_addr);
+
+                if (connect(heartbeat_socket, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                    is_connected = true;
+                    abnormal_disconnect = false;
+
+                    // 自动选择之前的摄像头
+                    int cam_index = select_camera(heartbeat_socket, last_cam_index);
+                    if (cam_index != -1) {
+                        std::thread(handle_heartbeat).detach();
+                        video_thread = std::thread(start_video_reception, last_server_info["ip"].asString());
+                        video_thread.join();
+                        break;
+                    }
+                }
+                close(heartbeat_socket);
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
+            abnormal_disconnect = false;
+        }
+
         if (connect(heartbeat_socket, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
             is_connected = true;
             std::cout << "已连接至服务端: " << target["name"].asString() << std::endl;
@@ -243,7 +315,27 @@ int main() {
                 video_thread.join();
             }
 
+            // 增加连接状态监控
+            std::atomic<bool> video_running{true};
+            std::thread([&](){
+                while (video_running && !exit_program) {
+                    if (!is_connected) {
+                        std::cout << "连接已断开，返回服务器列表" << std::endl;
+                        exit_program = true; // 触发视频线程退出
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+            }).detach();
+
+            // 启动视频线程
+            video_thread = std::thread(start_video_reception, target["ip"].asString());
+            video_thread.join();
+            video_running = false;
+
+            // 重置状态
             is_connected = false;
+            exit_program = false; // 重置退出标志
             close(heartbeat_socket);
         } else {
             std::cerr << "连接失败!" << std::endl;

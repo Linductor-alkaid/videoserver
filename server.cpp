@@ -108,6 +108,26 @@ void heartbeat_listener() {
                 break;
             }
         }
+        // 接收响应（增加错误检测）
+        int n = recv(heartbeat_socket, buffer, sizeof(buffer), 0);
+        if (n > 0) {
+            last_heartbeat = time(nullptr);
+            handle_status(atoi(buffer));
+        } else if (n == 0) {
+            std::cerr << "客户端正常关闭连接" << std::endl;
+            break;
+        } else {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                perror("心跳接收错误");
+                break;
+            }
+        }
+
+        // 超时检测（缩短至2秒）
+        if (time(nullptr) - last_heartbeat > 2) {
+            std::cerr << "心跳超时，连接中断!" << std::endl;
+            break;
+        }
         lock.unlock();
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
@@ -116,6 +136,11 @@ void heartbeat_listener() {
         close(heartbeat_socket);
         is_connected = false;
         heartbeat_timeout = false;
+    }
+    if (heartbeat_socket != -1) {
+        shutdown(heartbeat_socket, SHUT_RDWR);
+        close(heartbeat_socket);
+        heartbeat_socket = -1;
     }
 }
 
