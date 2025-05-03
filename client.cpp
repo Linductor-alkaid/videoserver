@@ -187,9 +187,9 @@ void start_video_reception(const std::string& server_ip) {
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
     GstBus *bus = gst_element_get_bus(pipeline);
-    while (!exit_program) {
+    while (is_connected && !exit_program) {
         GstMessage *msg = gst_bus_timed_pop_filtered(bus, 
-            GST_CLOCK_TIME_NONE, 
+            100 * GST_MSECOND, // 将超时设置为100毫秒
             static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_QOS));
         
         if (msg) {
@@ -256,12 +256,27 @@ int main() {
             continue;
         }
 
+        // 添加输入验证和异常捕获
+        int choice = -1;
+        try {
+            choice = std::stoi(input);
+        } catch (const std::invalid_argument& e) {
+            std::cerr << "错误：请输入数字编号！" << std::endl;
+            continue;
+        } catch (const std::out_of_range& e) {
+            std::cerr << "错误：编号超出有效范围！" << std::endl;
+            continue;
+        }
+
+
         // 建立连接
-        int choice = std::stoi(input);
         Json::Value target;
         {
             std::lock_guard<std::mutex> lock(servers_mutex);
-            if (choice < 0 || choice >= servers.size()) continue;
+            if (choice < 0 || choice >= servers.size()) {
+            std::cerr << "错误：无效的服务器编号！" << std::endl;
+            continue;
+            }
             target = servers[choice];
         }
 
@@ -321,7 +336,7 @@ int main() {
                 while (video_running && !exit_program) {
                     if (!is_connected) {
                         std::cout << "连接已断开，返回服务器列表" << std::endl;
-                        exit_program = true; // 触发视频线程退出
+                        video_running = false; // 触发视频线程退出
                         break;
                     }
                     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -335,7 +350,8 @@ int main() {
 
             // 重置状态
             is_connected = false;
-            exit_program = false; // 重置退出标志
+            abnormal_disconnect = false;
+            // exit_program = false; // 重置退出标志
             close(heartbeat_socket);
         } else {
             std::cerr << "连接失败!" << std::endl;

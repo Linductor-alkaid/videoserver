@@ -17,6 +17,7 @@ data: 2025/05/03
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <json/json.h>
+#include <csignal>
 
 // 全局状态管理
 std::atomic<bool> is_connected{false};
@@ -24,11 +25,19 @@ std::atomic<bool> heartbeat_timeout{false};
 std::atomic<bool> exit_program{false};
 std::mutex heartbeat_mutex;
 int heartbeat_socket = -1;
+static int listen_sock = -1;
 
 // 分辨率配置和摄像头列表
 const std::vector<std::pair<int, int>> RES_LEVELS = {{1280,720}, {640,360}, {320,180}};
 std::atomic<int> current_res_level{0};
 std::vector<int> available_cams;
+
+// 全局新增信号处理
+void signal_handler(int signum) {
+    std::cout << "\n收到终止信号，清理资源..." << std::endl;
+    exit_program = true;
+    close(listen_sock); 
+}
 
 // 状态处理函数
 void handle_status(int code) {
@@ -115,6 +124,7 @@ void heartbeat_listener() {
             handle_status(atoi(buffer));
         } else if (n == 0) {
             std::cerr << "客户端正常关闭连接" << std::endl;
+            is_connected = false;
             break;
         } else {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -145,37 +155,64 @@ void heartbeat_listener() {
 }
 
 // ================== 摄像头管理模块 ==================
-std::vector<int> get_available_cameras(int max_check = 10) {
+std::vector<int> get_available_cameras(int max_check = 5) { // 减少检测范围
     std::vector<int> cameras;
     for (int i = 0; i < max_check; ++i) {
-        cv::VideoCapture cap(i);
+        cv::VideoCapture cap(i, cv::CAP_V4L2); // 明确使用V4L2后端
         if (cap.isOpened()) {
-            cameras.push_back(i);
+            // 验证摄像头是否真正可用
+            cv::Mat test_frame;
+            if (cap.read(test_frame)) {
+                cameras.push_back(i);
+                std::cout << "发现有效摄像头: /dev/video" << i << std::endl;
+            }
             cap.release();
         }
     }
     return cameras;
 }
 
-void send_camera_list(int socket) {
+bool send_camera_list(int socket) {  // 修改返回类型为bool
     Json::Value cam_list;
     cam_list["type"] = "camera_list";
     for (size_t i = 0; i < available_cams.size(); ++i) {
         cam_list["cameras"].append(available_cams[i]);
     }
     std::string json_str = Json::FastWriter().write(cam_list);
-    send(socket, json_str.c_str(), json_str.size(), 0);
+    ssize_t sent_bytes = send(socket, json_str.c_str(), json_str.size(), 0);
+    
+    if (sent_bytes < 0) {
+        perror("发送摄像头列表失败");
+        return false;
+    } else if (sent_bytes != (ssize_t)json_str.size()) {
+        std::cerr << "警告: 摄像头列表数据未完整发送" << std::endl;
+        return false;
+    }
+    return true;
 }
 
 // ================== 视频传输模块 ==================
 void start_video_stream(const std::string& client_ip, int video_port, int camera_index) {
+    available_cams = get_available_cameras(); // 新增：重新检测
+    if (std::find(available_cams.begin(), available_cams.end(), camera_index) == available_cams.end()) {
+        std::cerr << "摄像头" << camera_index << "已不可用" << std::endl;
+        return;
+    }
     GstElement *pipeline = nullptr;
     gst_init(nullptr, nullptr);
     cv::VideoCapture cap(camera_index);
 
     if (!cap.isOpened()) {
-        std::cerr << "摄像头打开失败" << std::endl;
-        return;
+        std::cerr << "摄像头打开失败，尝试重新初始化..." << std::endl;
+        for (int i = 0; i < 3; ++i) { // 重试3次
+            cap.open(camera_index);
+            if (cap.isOpened()) break;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (!cap.isOpened()) {
+            std::cerr << "摄像头初始化最终失败" << std::endl;
+            return; // 提前返回避免后续错误
+        }
     }
 
     // 读取初始帧以确定参数
@@ -191,7 +228,6 @@ void start_video_stream(const std::string& client_ip, int video_port, int camera
     double fps = cap.get(cv::CAP_PROP_FPS);
     if (fps <= 0) fps = 30;
 
-    // ...（保持原有视频传输逻辑不变，修改udpsink目标地址为client_ip）...
     std::string pipeline_str = 
         "appsrc name=source ! "
         "videoconvert ! "
@@ -337,6 +373,13 @@ void start_video_stream(const std::string& client_ip, int video_port, int camera
 
 // ================== 主控制逻辑 ==================
 int main() {
+    // 注册信号处理
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    // 将listen_sock改为全局变量
+    
+
     available_cams = get_available_cameras();
     if (available_cams.empty()) {
         std::cerr << "错误: 未找到可用摄像头!" << std::endl;
@@ -345,45 +388,97 @@ int main() {
 
     std::thread broadcast_thread(broadcast_server_presence);
 
-    while (!exit_program) {
-        // 等待客户端连接
-        int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(5001);
-        addr.sin_addr.s_addr = INADDR_ANY;
-        bind(listen_sock, (struct sockaddr*)&addr, sizeof(addr));
-        listen(listen_sock, 5);
+    // 创建监听socket（保持长连接）
+    int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_sock < 0) {
+        perror("socket creation failed");
+        return 1;
+    }
 
-        std::cout << "等待客户端连接..." << std::endl;
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        heartbeat_socket = accept(listen_sock, (struct sockaddr*)&client_addr, &client_len);
+    int reuse = 1;
+    if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        perror("setsockopt failed");
         close(listen_sock);
+        return 1;
+    }
 
-        if (heartbeat_socket >= 0) {
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(5001);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(listen_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind failed");
+        close(listen_sock);
+        return 1;
+    }
+
+    if (listen(listen_sock, 5) < 0) {
+        perror("listen failed");
+        close(listen_sock);
+        return 1;
+    }
+
+    try {
+        while (!is_connected && !exit_program) {
+            std::cout << "等待客户端连接..." << std::endl;
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int client_sock = accept(listen_sock, (struct sockaddr*)&client_addr, &client_len);
+            if (client_sock < 0) {
+                if (exit_program) break; // 如果程序退出则终止循环
+                perror("accept error");
+                continue;
+            }
+
+            available_cams = get_available_cameras();  
+            if (available_cams.empty()) {
+                std::cerr << "错误: 当前无可用摄像头!" << std::endl;
+                close(client_sock);
+                continue;
+            }
+
             is_connected = true;
             std::string client_ip = inet_ntoa(client_addr.sin_addr);
             std::cout << "客户端连接来自: " << client_ip << std::endl;
 
             // 发送摄像头列表
-            send_camera_list(heartbeat_socket);
-            
+            if (!send_camera_list(client_sock)) {
+                close(client_sock);
+                continue; // 发送失败，跳过此客户端
+            }
+
             // 接收摄像头选择
             char buffer[256];
-            int n = recv(heartbeat_socket, buffer, sizeof(buffer), 0);
+            int n = recv(client_sock, buffer, sizeof(buffer), 0);
             if (n > 0) {
                 Json::Value selection;
-                Json::Reader().parse(buffer, buffer + n, selection);
-                int cam_index = selection["camera_index"].asInt();
-                
-                // 启动视频传输和心跳监听
-                std::thread(heartbeat_listener).detach();
-                start_video_stream(client_ip, 5000, cam_index);
+                if (Json::Reader().parse(buffer, buffer + n, selection)) {
+                    int cam_index = selection["camera_index"].asInt();
+                    
+                    // 设置心跳socket并启动线程
+                    heartbeat_socket = client_sock;
+                    std::thread(heartbeat_listener).detach();
+                    start_video_stream(client_ip, 5000, cam_index);
+                }
+            } else {
+                close(client_sock);
             }
         }
     }
+    catch (const std::exception& e) {
+        std::cerr << "致命错误: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "未知异常发生" << std::endl;
+    }
 
+    // 确保最终清理
+    if (listen_sock != -1) {
+        shutdown(listen_sock, SHUT_RDWR);
+        close(listen_sock);
+    }
+
+    // close(listen_sock);
     exit_program = true;
     broadcast_thread.join();
     return 0;
