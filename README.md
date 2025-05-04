@@ -86,7 +86,6 @@ make -j4
    - 开放TCP 5001
 3. 网络要求：
    - 确保处于同一局域网
-   - 支持IP广播（默认地址192.168.3.255）
 4. GStreamer插件：
    ```bash
    sudo apt install gstreamer1.0-plugins-base gstreamer1.0-plugins-good
@@ -96,3 +95,8 @@ make -j4
 - 发现协议：UDP 37020端口，JSON格式广播
 - 心跳协议：TCP 5001端口，500ms间隔
 - 视频传输：RTP over UDP 5000端口
+
+## 更新日志
+
+- 2025-05-03 v1.0.0 初始功能实现，需要修改支持的ip广播
+- 2025-05-04 v1.0.1 新增多网卡广播支持

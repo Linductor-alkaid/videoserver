@@ -18,6 +18,10 @@ data: 2025/05/03
 #include <unistd.h>
 #include <json/json.h>
 #include <csignal>
+#include <ifaddrs.h>
+#include <linux/if_packet.h>
+#include <net/if.h>
+
 
 // 全局状态管理
 std::atomic<bool> is_connected{false};
@@ -54,31 +58,86 @@ void handle_status(int code) {
 
 // ================== 网络通信模块 ==================
 void broadcast_server_presence() {
+    struct ifaddrs *ifaddr, *ifa;
+    std::vector<std::string> broadcast_addrs;
+
+    // 获取网络接口列表
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return;
+    }
+
+    // 第一次遍历：收集所有IPv4广播地址
+    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr)
+            continue;
+
+        // 只处理IPv4接口
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_broadaddr;
+            char buf[INET_ADDRSTRLEN];
+
+            // 检查接口状态：UP且不是回环接口
+            if ((ifa->ifa_flags & IFF_UP) && 
+                !(ifa->ifa_flags & IFF_LOOPBACK) &&
+                sa != nullptr) {
+                
+                // 获取广播地址
+                inet_ntop(AF_INET, &sa->sin_addr, buf, INET_ADDRSTRLEN);
+                broadcast_addrs.push_back(buf);
+                
+                std::cout << "发现活动接口: " << ifa->ifa_name 
+                          << " 广播地址: " << buf << std::endl;
+            }
+        }
+    }
+
+    // 创建广播socket
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return;
+    if (sock < 0) {
+        perror("广播socket创建失败");
+        freeifaddrs(ifaddr);
+        return;
+    }
 
-    // 启用广播
+    // 设置广播选项
     int broadcast = 1;
-    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) < 0) {
+        perror("设置广播选项失败");
+        close(sock);
+        freeifaddrs(ifaddr);
+        return;
+    }
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(37020);    // 发现协议端口
-    addr.sin_addr.s_addr = inet_addr("192.168.1.255");
-
+    // 准备广播消息
     Json::Value discovery_msg;
     discovery_msg["name"] = "Video-Server";
     discovery_msg["heartbeat_port"] = 5001;
     discovery_msg["video_port"] = 5000;
     std::string json_str = Json::FastWriter().write(discovery_msg);
 
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(37020);
+
+    // 定期广播
     while (!exit_program) {
-        sendto(sock, json_str.c_str(), json_str.size(), 0,
-              (struct sockaddr*)&addr, sizeof(addr));
+        for (const auto& bcast : broadcast_addrs) {
+            addr.sin_addr.s_addr = inet_addr(bcast.c_str());
+            
+            if (sendto(sock, json_str.c_str(), json_str.size(), 0,
+                      (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+                std::cerr << "广播发送失败到 " << bcast << ": " 
+                          << strerror(errno) << std::endl;
+            }
+        }
         std::this_thread::sleep_for(std::chrono::seconds(3));
     }
+
+    // 清理
     close(sock);
+    freeifaddrs(ifaddr);
 }
 
 // ================== 心跳检测模块 ==================
