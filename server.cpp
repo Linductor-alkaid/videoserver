@@ -479,7 +479,7 @@ int main() {
     }
 
     try {
-        while (!is_connected && !exit_program) {
+        while (!exit_program) {
             std::cout << "等待客户端连接..." << std::endl;
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);

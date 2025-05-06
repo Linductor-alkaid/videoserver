@@ -330,7 +330,7 @@ int main() {
                 video_thread.join();
             }
 
-            // 增加连接状态监控
+            // 连接状态监控
             std::atomic<bool> video_running{true};
             std::thread([&](){
                 while (video_running && !exit_program) {
